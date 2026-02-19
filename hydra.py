@@ -1678,6 +1678,11 @@ def cmd_merge(args: argparse.Namespace) -> int:
         return 0
     
     if not _git_ref_exists(root, branch_ref):
+        # Check if this was a --no-worktree agent (no branch created)
+        no_wt_marker = agents_dir / agent / task_id / ".no-worktree"
+        if no_wt_marker.exists():
+            print(f"[hydra] Agent '{agent}' was opened with --no-worktree; no branch to merge (commits are already on trunk).")
+            return 0
         raise HydraError(f"Agent branch not found: {branch_ref}")
 
     trunk = _default_trunk_ref(root)
@@ -1968,7 +1973,12 @@ def cmd_agent_open(args: argparse.Namespace) -> int:
     task_id = _sanitize_task_id(args.task)
     task = _load_task(tasks_dir, task_id)
 
-    worktree = agents_dir / agent / task_id
+    no_worktree = getattr(args, "no_worktree", False)
+
+    if no_worktree:
+        worktree = root  # Work directly in project root
+    else:
+        worktree = agents_dir / agent / task_id
     branch = f"agent/{agent}/{task_id}"
     base_ref = args.base or _default_base_ref(root)
     project_session = config.get("tmux_session", "hydra")
@@ -1987,16 +1997,41 @@ def cmd_agent_open(args: argparse.Namespace) -> int:
         with _connect_db(hydra_dir) as conn:
             _acquire_locks(conn, files=files_to_lock, agent=agent, task=task_id, tmux_session=None)
 
-    try:
-        _create_worktree(root, worktree=worktree, branch=branch, base_ref=base_ref, dry_run=args.dry_run)
-        if not args.no_shared_deps:
-            _share_deps(root, worktree, DEFAULT_SHARED_DEPS, dry_run=args.dry_run)
+    if no_worktree:
+        # --no-worktree: skip auto-commit, worktree creation, and shared deps.
+        # Record a marker so spawn/close know this agent has no worktree.
+        marker = agents_dir / agent / task_id
+        if not args.dry_run:
+            marker.mkdir(parents=True, exist_ok=True)
+            (marker / ".no-worktree").write_text("1", encoding="utf-8")
+        else:
+            print(f"[dry-run] mkdir {marker} + write .no-worktree marker")
+        print(f"[hydra] --no-worktree: agent will work directly in {root}")
+    else:
+        # --- auto-commit unstaged/staged changes before worktree creation ---
+        if not args.dry_run:
+            st = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, cwd=root)
+            if st.stdout.strip():
+                subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", f"auto: pre-worktree commit for {agent}"],
+                    cwd=root,
+                    check=True,
+                )
+                print(f"[hydra] auto-committed unstaged changes before creating worktree")
+        # --- end auto-commit ---
 
-        # Create symlink to hydra.py for easy access
-        hydra_link = worktree / "hydra.py"
-        hydra_source = root / "hydra.py"
-        if not args.dry_run and hydra_source.exists() and not hydra_link.exists():
-            _relative_symlink(hydra_source, hydra_link, dry_run=False)
+    try:
+        if not no_worktree:
+            _create_worktree(root, worktree=worktree, branch=branch, base_ref=base_ref, dry_run=args.dry_run)
+            if not args.no_shared_deps:
+                _share_deps(root, worktree, DEFAULT_SHARED_DEPS, dry_run=args.dry_run)
+
+            # Create symlink to hydra.py for easy access
+            hydra_link = worktree / "hydra.py"
+            hydra_source = root / "hydra.py"
+            if not args.dry_run and hydra_source.exists() and not hydra_link.exists():
+                _relative_symlink(hydra_source, hydra_link, dry_run=False)
 
         if not args.no_tmux and _tmux_available():
             shell = args.shell or os.environ.get("SHELL") or "/bin/bash"
@@ -2108,11 +2143,25 @@ def cmd_agent_close(args: argparse.Namespace) -> int:
 
     if args.remove_worktree:
         worktree = agents_dir / agent / task_id
-        cmd = ["git", "worktree", "remove", "--force", str(worktree)]
-        if args.dry_run:
-            print("[dry-run]", " ".join(cmd))
+        no_worktree = (worktree / ".no-worktree").exists()
+        if no_worktree:
+            # No real worktree to remove; just clean up the marker directory
+            if args.dry_run:
+                print(f"[dry-run] rm -rf {worktree} (no-worktree marker only)")
+            else:
+                import shutil
+                shutil.rmtree(worktree, ignore_errors=True)
+                # Clean up empty parent dir
+                agent_dir = agents_dir / agent
+                if agent_dir.exists() and not any(agent_dir.iterdir()):
+                    agent_dir.rmdir()
+                print(f"Cleaned up no-worktree marker for {agent}/{task_id}")
         else:
-            _run(cmd, cwd=root, capture=True)
+            cmd = ["git", "worktree", "remove", "--force", str(worktree)]
+            if args.dry_run:
+                print("[dry-run]", " ".join(cmd))
+            else:
+                _run(cmd, cwd=root, capture=True)
 
     print(f"Released {released} locks for {agent}/{task_id}")
     return 0
@@ -2126,10 +2175,15 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
     agent = _sanitize_ref_component(args.name, label="agent name")
     task_id = _sanitize_task_id(args.task)
 
-    # Get worktree path
-    worktree = agents_dir / agent / task_id
-    if not worktree.exists():
-        raise HydraError(f"Worktree not found: {worktree}. Run 'agent open' first.")
+    # Get worktree path (or project root for --no-worktree agents)
+    agent_task_dir = agents_dir / agent / task_id
+    no_worktree = (agent_task_dir / ".no-worktree").exists()
+    if no_worktree:
+        worktree = root
+    else:
+        worktree = agent_task_dir
+        if not worktree.exists():
+            raise HydraError(f"Worktree not found: {worktree}. Run 'agent open' first.")
 
     # Get project session name from config
     config_path = hydra_dir / CONFIG_NAME
@@ -2144,7 +2198,7 @@ def cmd_agent_spawn(args: argparse.Namespace) -> int:
     # Determine agent type and command
     agent_type = args.type or "codex"
     if agent_type == "codex":
-        cmd = "codex --full-auto"
+        cmd = "codex --yolo"
     elif agent_type == "gemini":
         cmd = "gemini --yolo"
     else:
@@ -2527,6 +2581,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-tmux", action="store_true", help="Do not create a tmux session")
     sp.add_argument("--shell", help="Shell to run inside tmux (default: $SHELL)")
     sp.add_argument("--no-shared-deps", action="store_true", help="Do not symlink shared deps like node_modules")
+    sp.add_argument("--no-worktree", action="store_true", help="Skip worktree/branch creation; work directly in project root")
     sp.add_argument("--dry-run", action="store_true", help="Print actions without changing anything")
     sp.set_defaults(func=cmd_agent_open)
 
